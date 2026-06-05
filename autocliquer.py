@@ -86,6 +86,7 @@ class Profile:
     profile_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     name: str = "Perfil 1"
     url: str = DEFAULT_URL
+    incognito: bool = False
     steps: list[ClickStep] = field(default_factory=list)
 
     @classmethod
@@ -94,6 +95,7 @@ class Profile:
             profile_id=str(data.get("profile_id") or uuid.uuid4()),
             name=str(data.get("name") or "Perfil"),
             url=str(data.get("url") or DEFAULT_URL),
+            incognito=bool(data.get("incognito", False)),
             steps=[ClickStep.from_dict(item) for item in data.get("steps", [])],
         )
 
@@ -102,6 +104,7 @@ class Profile:
             "profile_id": self.profile_id,
             "name": self.name,
             "url": self.url,
+            "incognito": self.incognito,
             "steps": [step.to_dict() for step in self.steps],
         }
 
@@ -136,8 +139,10 @@ class BrowserSession:
         self.thread.start()
         self.playwright = None
         self.browser = None
+        self.browser_incognito = None
         self.context = None
         self.page = None
+        self.context_incognito = False
         self.record_binding_added = False
         self.adblock_installed = False
         self.run_task = None
@@ -158,18 +163,35 @@ class BrowserSession:
         except Exception as exc:
             self.on_error(str(exc))
 
-    def open_browser(self, url):
-        self._submit(self._open_browser(url))
+    def open_browser(self, url, incognito=False):
+        self._submit(self._open_browser(url, incognito))
 
-    async def _open_browser(self, url):
+    async def _open_browser(self, url, incognito=False):
         if async_playwright is None:
             raise RuntimeError("Playwright nao esta instalado. Rode: pip install -r requirements.txt")
         if self.playwright is None:
             self.playwright = await async_playwright().start()
+
+        if self.browser is not None and self.browser_incognito != incognito:
+            await self._close_browser_only()
+
         if self.browser is None:
-            self.browser = await self.playwright.chromium.launch(headless=False)
+            launch_options = {"headless": False}
+            if incognito:
+                launch_options["args"] = ["--incognito"]
+            self.browser = await self.playwright.chromium.launch(**launch_options)
+            self.browser_incognito = incognito
+
+        if self.context is None or self.context_incognito != incognito or incognito:
+            if self.context:
+                await self.context.close()
             self.context = await self.browser.new_context(no_viewport=True)
+            self.context_incognito = incognito
+            self.page = None
+            self.record_binding_added = False
+            self.adblock_installed = False
             await self._install_adblock()
+
         if self.page is None or self.page.is_closed():
             self.page = await self.context.new_page()
             self.record_binding_added = False
@@ -179,7 +201,8 @@ class BrowserSession:
             target = "https://" + target
         self.on_status("Abrindo pagina...")
         await self.page.goto(target, wait_until="domcontentloaded")
-        self.on_status("Navegador aberto com adblock")
+        mode = "anonimo" if incognito else "normal"
+        self.on_status(f"Navegador aberto em modo {mode} com adblock")
 
     async def _install_adblock(self):
         if self.adblock_installed or self.context is None:
@@ -275,12 +298,22 @@ class BrowserSession:
     async def _close(self):
         if self.stop_event:
             self.stop_event.set()
-        if self.context:
-            await self.context.close()
-        if self.browser:
-            await self.browser.close()
+        await self._close_browser_only()
         if self.playwright:
             await self.playwright.stop()
+
+    async def _close_browser_only(self):
+        if self.context:
+            await self.context.close()
+            self.context = None
+        if self.browser:
+            await self.browser.close()
+            self.browser = None
+        self.browser_incognito = None
+        self.page = None
+        self.context_incognito = False
+        self.record_binding_added = False
+        self.adblock_installed = False
 
     def _require_page(self):
         if self.page is None or self.page.is_closed():
@@ -373,7 +406,7 @@ class ProfileFrame(ttk.Frame):
 
     def build_ui(self):
         self.columnconfigure(1, weight=1)
-        self.rowconfigure(4, weight=1)
+        self.rowconfigure(5, weight=1)
 
         ttk.Label(self, text="Nome").grid(row=0, column=0, sticky="w")
         self.name_var = tk.StringVar(value=self.profile.name)
@@ -385,8 +418,16 @@ class ProfileFrame(ttk.Frame):
         self.url_entry = ttk.Entry(self, textvariable=self.url_var)
         self.url_entry.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
 
+        self.incognito_var = tk.BooleanVar(value=self.profile.incognito)
+        ttk.Checkbutton(
+            self,
+            text="Abrir em guia anonima com adblock",
+            variable=self.incognito_var,
+            command=self.save_basic_fields,
+        ).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+
         buttons = ttk.Frame(self)
-        buttons.grid(row=2, column=0, columnspan=2, sticky="ew", pady=12)
+        buttons.grid(row=3, column=0, columnspan=2, sticky="ew", pady=12)
         for index in range(5):
             buttons.columnconfigure(index, weight=1)
 
@@ -397,7 +438,7 @@ class ProfileFrame(ttk.Frame):
         ttk.Button(buttons, text="Limpar", command=self.clear_steps).grid(row=0, column=4, sticky="ew", padx=3)
 
         self.status_var = tk.StringVar(value="Pronto")
-        ttk.Label(self, textvariable=self.status_var).grid(row=3, column=0, columnspan=2, sticky="w")
+        ttk.Label(self, textvariable=self.status_var).grid(row=4, column=0, columnspan=2, sticky="w")
 
         columns = ("num", "delay", "selector", "pos")
         self.tree = ttk.Treeview(self, columns=columns, show="headings", height=12)
@@ -409,10 +450,10 @@ class ProfileFrame(ttk.Frame):
         self.tree.column("delay", width=90, anchor="center")
         self.tree.column("selector", width=520)
         self.tree.column("pos", width=110, anchor="center")
-        self.tree.grid(row=4, column=0, columnspan=2, sticky="nsew")
+        self.tree.grid(row=5, column=0, columnspan=2, sticky="nsew")
 
         scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
-        scrollbar.grid(row=4, column=2, sticky="ns")
+        scrollbar.grid(row=5, column=2, sticky="ns")
         self.tree.configure(yscrollcommand=scrollbar.set)
 
         self.name_var.trace_add("write", lambda *_: self.save_basic_fields())
@@ -445,13 +486,14 @@ class ProfileFrame(ttk.Frame):
     def save_basic_fields(self):
         self.profile.name = self.name_var.get().strip() or "Perfil"
         self.profile.url = self.url_var.get().strip() or DEFAULT_URL
+        self.profile.incognito = bool(self.incognito_var.get())
         self.app.rename_current_tab(self.profile.name)
         self.app.save_profiles()
 
     def open_browser(self):
         self.save_basic_fields()
         self.status_var.set("Abrindo navegador...")
-        self.browser.open_browser(self.profile.url)
+        self.browser.open_browser(self.profile.url, self.profile.incognito)
 
     def start_recording(self):
         self.save_basic_fields()
