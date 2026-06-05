@@ -1,6 +1,8 @@
 import asyncio
 import json
+import os
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -8,7 +10,7 @@ import tkinter as tk
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 
 try:
     from pynput import keyboard
@@ -24,6 +26,81 @@ except Exception:
 APP_DIR = Path(__file__).resolve().parent
 PROFILES_FILE = APP_DIR / "profiles.json"
 DEFAULT_URL = "https://www.google.com"
+BROWSER_CHOICES = ("Brave", "Firefox", "Chrome")
+
+
+def find_brave_executable():
+    for candidate in (shutil.which("brave"), shutil.which("brave.exe"), shutil.which("brave-browser")):
+        if candidate:
+            return candidate
+
+    candidates = []
+    if os.name == "nt":
+        for env_name in ("LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"):
+            base = os.environ.get(env_name)
+            if base:
+                candidates.append(Path(base) / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe")
+    elif sys.platform == "darwin":
+        candidates.append(Path("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"))
+    else:
+        candidates.extend(
+            [
+                Path("/usr/bin/brave-browser"),
+                Path("/usr/bin/brave"),
+                Path("/snap/bin/brave"),
+                Path("/opt/brave.com/brave/brave"),
+            ]
+        )
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+
+    return None
+
+
+def find_chrome_executable():
+    for candidate in (shutil.which("chrome"), shutil.which("chrome.exe"), shutil.which("google-chrome"), shutil.which("google-chrome-stable")):
+        if candidate:
+            return candidate
+
+    candidates = []
+    if os.name == "nt":
+        for env_name in ("LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"):
+            base = os.environ.get(env_name)
+            if base:
+                candidates.append(Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe")
+    elif sys.platform == "darwin":
+        candidates.append(Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"))
+    else:
+        candidates.extend(
+            [
+                Path("/usr/bin/google-chrome"),
+                Path("/usr/bin/google-chrome-stable"),
+                Path("/opt/google/chrome/google-chrome"),
+            ]
+        )
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+
+    return None
+
+
+def default_browser_choice():
+    return "Brave" if find_brave_executable() else "Firefox"
+
+
+def normalize_browser_choice(value):
+    choice = str(value or "").strip().lower()
+    if choice in {"firefox", "mozilla firefox"}:
+        return "Firefox"
+    if choice in {"brave", "brave browser"}:
+        return "Brave"
+    if choice in {"chrome", "google chrome"}:
+        return "Chrome"
+    return default_browser_choice()
 
 AD_BLOCK_PATTERNS = (
     "doubleclick.net",
@@ -86,6 +163,7 @@ class Profile:
     profile_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     name: str = "Perfil 1"
     url: str = DEFAULT_URL
+    browser: str = field(default_factory=default_browser_choice)
     incognito: bool = False
     steps: list[ClickStep] = field(default_factory=list)
 
@@ -95,6 +173,7 @@ class Profile:
             profile_id=str(data.get("profile_id") or uuid.uuid4()),
             name=str(data.get("name") or "Perfil"),
             url=str(data.get("url") or DEFAULT_URL),
+            browser=normalize_browser_choice(data.get("browser")),
             incognito=bool(data.get("incognito", False)),
             steps=[ClickStep.from_dict(item) for item in data.get("steps", [])],
         )
@@ -104,6 +183,7 @@ class Profile:
             "profile_id": self.profile_id,
             "name": self.name,
             "url": self.url,
+            "browser": normalize_browser_choice(self.browser),
             "incognito": self.incognito,
             "steps": [step.to_dict() for step in self.steps],
         }
@@ -139,6 +219,7 @@ class BrowserSession:
         self.thread.start()
         self.playwright = None
         self.browser = None
+        self.browser_name = None
         self.browser_incognito = None
         self.context = None
         self.page = None
@@ -163,23 +244,29 @@ class BrowserSession:
         except Exception as exc:
             self.on_error(str(exc))
 
-    def open_browser(self, url, incognito=False):
-        self._submit(self._open_browser(url, incognito))
+    def open_browser(self, url, browser_name=None, incognito=False):
+        self._submit(self._open_browser(url, browser_name, incognito))
 
-    async def _open_browser(self, url, incognito=False):
+    async def _open_browser(self, url, browser_name=None, incognito=False):
         if async_playwright is None:
             raise RuntimeError("Playwright nao esta instalado. Rode: pip install -r requirements.txt")
         if self.playwright is None:
             self.playwright = await async_playwright().start()
 
-        if self.browser is not None and self.browser_incognito != incognito:
+        browser_name = normalize_browser_choice(browser_name)
+
+        if self.browser is not None and self.browser_name != browser_name:
+            pending_browser = await self._launch_browser(browser_name, incognito)
+            await self._close_browser_only()
+            self.browser = pending_browser
+            self.browser_name = browser_name
+            self.browser_incognito = incognito
+        elif self.browser is not None and self.browser_incognito != incognito:
             await self._close_browser_only()
 
         if self.browser is None:
-            launch_options = {"headless": False}
-            if incognito:
-                launch_options["args"] = ["--incognito"]
-            self.browser = await self.playwright.chromium.launch(**launch_options)
+            self.browser = await self._launch_browser(browser_name, incognito)
+            self.browser_name = browser_name
             self.browser_incognito = incognito
 
         if self.context is None or self.context_incognito != incognito or incognito:
@@ -202,7 +289,40 @@ class BrowserSession:
         self.on_status("Abrindo pagina...")
         await self.page.goto(target, wait_until="domcontentloaded")
         mode = "anonimo" if incognito else "normal"
-        self.on_status(f"Navegador aberto em modo {mode} com adblock")
+        self.on_status(f"Navegador {browser_name.lower()} aberto em modo {mode} com adblock")
+
+    async def _launch_browser(self, browser_name, incognito):
+        if browser_name == "Firefox":
+            launch_options = {"headless": False}
+            if incognito:
+                launch_options["args"] = ["-private-window"]
+            try:
+                return await self.playwright.firefox.launch(**launch_options)
+            except Exception as exc:
+                raise RuntimeError("Firefox do Playwright nao esta instalado. Rode: python -m playwright install firefox") from exc
+
+        if browser_name == "Chrome":
+            chrome_executable = find_chrome_executable()
+            launch_options = {"headless": False}
+            if incognito:
+                launch_options["args"] = ["--incognito"]
+            if chrome_executable:
+                launch_options["executable_path"] = chrome_executable
+            else:
+                launch_options["channel"] = "chrome"
+            try:
+                return await self.playwright.chromium.launch(**launch_options)
+            except Exception as exc:
+                raise RuntimeError("Chrome nao encontrado. Instale o Google Chrome ou escolha Brave/Firefox.") from exc
+
+        brave_executable = find_brave_executable()
+        if not brave_executable:
+            raise RuntimeError("Brave nao encontrado. Instale o Brave ou escolha Firefox.")
+
+        launch_options = {"headless": False, "executable_path": brave_executable}
+        if incognito:
+            launch_options["args"] = ["--incognito"]
+        return await self.playwright.chromium.launch(**launch_options)
 
     async def _install_adblock(self):
         if self.adblock_installed or self.context is None:
@@ -309,6 +429,7 @@ class BrowserSession:
         if self.browser:
             await self.browser.close()
             self.browser = None
+        self.browser_name = None
         self.browser_incognito = None
         self.page = None
         self.context_incognito = False
@@ -406,7 +527,7 @@ class ProfileFrame(ttk.Frame):
 
     def build_ui(self):
         self.columnconfigure(1, weight=1)
-        self.rowconfigure(5, weight=1)
+        self.rowconfigure(6, weight=1)
 
         ttk.Label(self, text="Nome").grid(row=0, column=0, sticky="w")
         self.name_var = tk.StringVar(value=self.profile.name)
@@ -418,16 +539,21 @@ class ProfileFrame(ttk.Frame):
         self.url_entry = ttk.Entry(self, textvariable=self.url_var)
         self.url_entry.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
 
+        ttk.Label(self, text="Navegador").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.browser_var = tk.StringVar(value=normalize_browser_choice(self.profile.browser))
+        self.browser_combo = ttk.Combobox(self, textvariable=self.browser_var, values=BROWSER_CHOICES, state="readonly")
+        self.browser_combo.grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
+
         self.incognito_var = tk.BooleanVar(value=self.profile.incognito)
         ttk.Checkbutton(
             self,
             text="Abrir em guia anonima com adblock",
             variable=self.incognito_var,
             command=self.save_basic_fields,
-        ).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        ).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
 
         buttons = ttk.Frame(self)
-        buttons.grid(row=3, column=0, columnspan=2, sticky="ew", pady=12)
+        buttons.grid(row=4, column=0, columnspan=2, sticky="ew", pady=12)
         for index in range(5):
             buttons.columnconfigure(index, weight=1)
 
@@ -438,7 +564,7 @@ class ProfileFrame(ttk.Frame):
         ttk.Button(buttons, text="Limpar", command=self.clear_steps).grid(row=0, column=4, sticky="ew", padx=3)
 
         self.status_var = tk.StringVar(value="Pronto")
-        ttk.Label(self, textvariable=self.status_var).grid(row=4, column=0, columnspan=2, sticky="w")
+        ttk.Label(self, textvariable=self.status_var).grid(row=5, column=0, columnspan=2, sticky="w")
 
         columns = ("num", "delay", "selector", "pos")
         self.tree = ttk.Treeview(self, columns=columns, show="headings", height=12)
@@ -450,14 +576,15 @@ class ProfileFrame(ttk.Frame):
         self.tree.column("delay", width=90, anchor="center")
         self.tree.column("selector", width=520)
         self.tree.column("pos", width=110, anchor="center")
-        self.tree.grid(row=5, column=0, columnspan=2, sticky="nsew")
+        self.tree.grid(row=6, column=0, columnspan=2, sticky="nsew")
 
         scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
-        scrollbar.grid(row=5, column=2, sticky="ns")
+        scrollbar.grid(row=6, column=2, sticky="ns")
         self.tree.configure(yscrollcommand=scrollbar.set)
 
         self.name_var.trace_add("write", lambda *_: self.save_basic_fields())
         self.url_var.trace_add("write", lambda *_: self.save_basic_fields())
+        self.browser_var.trace_add("write", lambda *_: self.save_basic_fields())
 
     def enqueue(self, kind, payload):
         self.events.put((kind, payload))
@@ -486,6 +613,7 @@ class ProfileFrame(ttk.Frame):
     def save_basic_fields(self):
         self.profile.name = self.name_var.get().strip() or "Perfil"
         self.profile.url = self.url_var.get().strip() or DEFAULT_URL
+        self.profile.browser = normalize_browser_choice(self.browser_var.get())
         self.profile.incognito = bool(self.incognito_var.get())
         self.app.rename_current_tab(self.profile.name)
         self.app.save_profiles()
@@ -493,7 +621,7 @@ class ProfileFrame(ttk.Frame):
     def open_browser(self):
         self.save_basic_fields()
         self.status_var.set("Abrindo navegador...")
-        self.browser.open_browser(self.profile.url, self.profile.incognito)
+        self.browser.open_browser(self.profile.url, self.profile.browser, self.profile.incognito)
 
     def start_recording(self):
         self.save_basic_fields()
@@ -580,6 +708,7 @@ class ClickRecorderApp(tk.Tk):
 
         ttk.Button(top, text="Novo perfil", command=self.add_profile).pack(side="left")
         ttk.Button(top, text="Remover perfil", command=self.remove_current_profile).pack(side="left", padx=(8, 0))
+        ttk.Button(top, text="Clonar perfil", command=self.clone_current_profile).pack(side="left", padx=(8, 0))
         ttk.Label(top, text="Use F8 para parar gravacao ou execucao.").pack(side="left", padx=16)
 
         self.notebook = ttk.Notebook(self)
@@ -597,6 +726,34 @@ class ClickRecorderApp(tk.Tk):
         self.notebook.add(frame, text=profile.name)
         self.notebook.select(frame)
         self.save_profiles()
+
+    def clone_current_profile(self):
+        frame = self.current_frame()
+        if not frame:
+            return
+
+        source_profile = frame.profile
+        source_browser = normalize_browser_choice(source_profile.browser)
+        suggested_browser = next((choice for choice in BROWSER_CHOICES if choice != source_browser), source_browser)
+        browser_choice = simpledialog.askstring(
+            "Clonar perfil",
+            "Navegador do clone (Brave, Firefox ou Chrome):",
+            initialvalue=suggested_browser,
+            parent=self,
+        )
+        if browser_choice is None:
+            return
+
+        target_browser = browser_choice.strip() or suggested_browser
+        target_browser = normalize_browser_choice(target_browser)
+        cloned_profile = Profile(
+            name=f"{source_profile.name} - {target_browser}",
+            url=source_profile.url,
+            browser=target_browser,
+            incognito=source_profile.incognito,
+            steps=[ClickStep.from_dict(step.to_dict()) for step in source_profile.steps],
+        )
+        self.add_profile(cloned_profile)
 
     def remove_current_profile(self):
         if len(self.frames) <= 1:
